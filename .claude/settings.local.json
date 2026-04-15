@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(zip -r multicam_render.zip multicam_render/)",
+      "Bash(python -c ':*)"
+    ]
+  }
+}
