@@ -112,8 +112,9 @@ def _update_cam_range_from_selection(self, context):
         return
     fmin, fmax = get_keyframe_range(cam_obj)
     if fmin is not None:
-        self.multicam_new_cam_start = fmin
-        self.multicam_new_cam_end   = fmax
+        duration = fmax - fmin
+        self.multicam_new_cam_start = fmax + 1
+        self.multicam_new_cam_end   = fmax + 1 + duration
 
 
 def _restore_state(scene):
