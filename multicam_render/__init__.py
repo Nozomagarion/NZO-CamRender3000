@@ -27,6 +27,7 @@ bl_info = {
 }
 
 import bpy
+import os
 import time as _time
 from bpy.props import (StringProperty, BoolProperty,
                        CollectionProperty, IntProperty, EnumProperty)
@@ -49,6 +50,50 @@ _progress = {
 }
 
 _redraw_running = [False]  # whether the redraw timer is active
+
+# ── Thumbnail preview collection (lazy-initialised in register()) ──
+_preview_coll = None
+
+
+def _thumb_key(cam_name):
+    return f"thumb_{cam_name}"
+
+
+def _thumb_path(cam_name):
+    import tempfile, re
+    safe = re.sub(r'[^\w\-]', '_', cam_name)
+    return os.path.join(tempfile.gettempdir(), f"nzo_thumb_{safe}.png")
+
+
+def _load_thumb(cam_name):
+    """Load (or force-reload) one thumbnail into the preview collection.
+    Returns True if the file exists and was loaded."""
+    import os as _os
+    pcoll = _preview_coll
+    if pcoll is None:
+        return False
+    path = _thumb_path(cam_name)
+    if not _os.path.isfile(path):
+        return False
+    key = _thumb_key(cam_name)
+    try:
+        pcoll.load(key, path, 'IMAGE', force_reload=True)
+        return True
+    except Exception:
+        return False
+
+
+def _thumb_icon_id(cam_name):
+    """Return the icon_id for this camera's thumbnail, or 0 if not available."""
+    if _preview_coll is None:
+        return 0
+    key = _thumb_key(cam_name)
+    if key not in _preview_coll:
+        _load_thumb(cam_name)
+    if key in _preview_coll:
+        return _preview_coll[key].icon_id
+    return 0
+
 
 # Extra live stats updated by the redraw timer
 _render_stats = {
@@ -369,7 +414,11 @@ class MULTICAM_UL_CameraList(UIList):
             row.prop(item, "enabled", text="")
             sub = row.row()
             sub.enabled = item.enabled
-            sub.label(text=item.cam_name, icon="CAMERA_DATA")
+            icon_id = _thumb_icon_id(item.cam_name)
+            if icon_id:
+                sub.label(text=item.cam_name, icon_value=icon_id)
+            else:
+                sub.label(text=item.cam_name, icon="CAMERA_DATA")
         elif self.layout_type == "GRID":
             layout.alignment = "CENTER"
             layout.prop(item, "enabled", text="")
@@ -750,6 +799,63 @@ class MULTICAM_OT_AssembleVideo(Operator):
 
 
 # ──────────────────────────────────────────────────────────────
+#  Operator: Generate camera thumbnails
+# ──────────────────────────────────────────────────────────────
+
+class MULTICAM_OT_GenerateThumbnails(Operator):
+    bl_idname      = "multicam.generate_thumbnails"
+    bl_label       = "Generate Camera Thumbnails"
+    bl_description = (
+        "OpenGL-render a small preview for each camera in the list "
+        "and display it in the panel"
+    )
+
+    def execute(self, context):
+        scene = context.scene
+        col   = scene.multicam_cameras
+
+        if not col:
+            self.report({"WARNING"}, "Camera list is empty — click Refresh first.")
+            return {"CANCELLED"}
+
+        # ── Save render state we'll temporarily change ──────────
+        orig_cam  = scene.camera
+        orig_rx   = scene.render.resolution_x
+        orig_ry   = scene.render.resolution_y
+        orig_pct  = scene.render.resolution_percentage
+        orig_path = scene.render.filepath
+
+        # Tiny resolution for fast OpenGL captures
+        scene.render.resolution_x          = 320
+        scene.render.resolution_y          = 180
+        scene.render.resolution_percentage = 100
+
+        count = 0
+        for item in col:
+            cam_obj = bpy.data.objects.get(item.cam_name)
+            if cam_obj is None:
+                continue
+            scene.camera        = cam_obj
+            scene.render.filepath = _thumb_path(item.cam_name)
+            try:
+                bpy.ops.render.opengl(write_still=True, view_context=False)
+                if _load_thumb(item.cam_name):
+                    count += 1
+            except Exception as e:
+                print(f"[MultiCam] Thumbnail failed for {item.cam_name}: {e}")
+
+        # ── Restore render state ────────────────────────────────
+        scene.camera                       = orig_cam
+        scene.render.resolution_x          = orig_rx
+        scene.render.resolution_y          = orig_ry
+        scene.render.resolution_percentage = orig_pct
+        scene.render.filepath              = orig_path
+
+        self.report({"INFO"}, f"{count} thumbnail(s) generated.")
+        return {"FINISHED"}
+
+
+# ──────────────────────────────────────────────────────────────
 #  Operator: Clear render history
 # ──────────────────────────────────────────────────────────────
 
@@ -1016,8 +1122,21 @@ class MULTICAM_PT_MainPanel(Panel):
                 scene, "multicam_active_index",
                 rows=3,
             )
+
+            # ── Selected camera thumbnail preview ───────────────
+            idx     = scene.multicam_active_index
+            sel_cam = cam_col[idx].cam_name if 0 <= idx < len(cam_col) else None
+            if sel_cam:
+                icon_id = _thumb_icon_id(sel_cam)
+                if icon_id:
+                    col.separator(factor=0.5)
+                    col.template_icon(icon_value=icon_id, scale=6.0)
         else:
             col.label(text="(click Refresh to scan cameras)")
+
+        layout.operator("multicam.generate_thumbnails",
+                        text="Generate Thumbnails",
+                        icon="RESTRICT_RENDER_OFF")
 
         layout.separator()
         row = layout.row()
@@ -1122,6 +1241,7 @@ _CLASSES = (
     MULTICAM_OT_RefreshCameras,
     MULTICAM_OT_AssembleVideo,
     MULTICAM_OT_ClearHistory,
+    MULTICAM_OT_GenerateThumbnails,
     MULTICAM_OT_AddCamera,
     MULTICAM_OT_RenderSequence,
     MULTICAM_PT_MainPanel,
@@ -1130,6 +1250,9 @@ _CLASSES = (
 
 
 def register():
+    global _preview_coll
+    if _preview_coll is None:
+        _preview_coll = bpy.utils.previews.new()
     for cls in _CLASSES:
         bpy.utils.register_class(cls)
     bpy.types.Scene.multicam_cameras = CollectionProperty(
@@ -1190,6 +1313,10 @@ def register():
 
 
 def unregister():
+    global _preview_coll
+    if _preview_coll is not None:
+        bpy.utils.previews.remove(_preview_coll)
+        _preview_coll = None
     _unregister_handlers()
     _redraw_running[0] = False
     for cls in reversed(_CLASSES):
