@@ -696,24 +696,53 @@ class MULTICAM_PT_MainPanel(Panel):
         box = layout.box()
         box.label(text="Create Camera", icon="ADD")
 
-        # Frame range row
-        row = box.row(align=True)
-        row.label(text="Range :")
-        sub = row.row(align=True)
-        sub.prop(scene, "multicam_new_cam_start", text="Start")
-        sub.prop(scene, "multicam_new_cam_end",   text="End")
-
-        # Duration hint
         fstart = scene.multicam_new_cam_start
         fend   = scene.multicam_new_cam_end
         dur    = fend - fstart
-        hint   = f"{dur} frames" if dur > 0 else "⚠ end must be > start"
-        box.label(text=hint, icon="TIME")
 
-        # Create button
+        # ── Selected camera info (reference) ───────────────────
+        col_info = box.column(align=True)
+        cam_col  = scene.multicam_cameras
+        idx      = scene.multicam_active_index
+        ref_cam  = None
+        if 0 <= idx < len(cam_col):
+            ref_cam = bpy.data.objects.get(cam_col[idx].cam_name)
+
+        if ref_cam is not None:
+            rf_min, rf_max = get_keyframe_range(ref_cam)
+            if rf_min is not None:
+                # Current camera range — greyed out, read-only look
+                row_ref = col_info.row(align=True)
+                row_ref.enabled = False          # greyed = reference only
+                row_ref.label(text=f"{ref_cam.name}", icon="CAMERA_DATA")
+                row_ref.label(text=f"{rf_min}  →  {rf_max}")
+            else:
+                col_info.label(text=f"{ref_cam.name}  (no keyframes)", icon="CAMERA_DATA")
+        else:
+            col_info.label(text="No camera selected", icon="CAMERA_DATA")
+
+        col_info.separator(factor=0.5)
+
+        # ── New camera range (editable) ─────────────────────────
+        row_new = col_info.row(align=True)
+        row_new.label(text="New cam  ", icon="ADD")
+        sub = row_new.row(align=True)
+        sub.prop(scene, "multicam_new_cam_start", text="")
+        sub.label(text="→")
+        sub.prop(scene, "multicam_new_cam_end",   text="")
+
+        # Duration hint (valid / invalid feedback)
+        if dur > 0:
+            col_info.label(text=f"{dur} frames", icon="TIME")
+        else:
+            col_info.label(text="End must be greater than Start", icon="ERROR")
+
+        box.separator(factor=0.3)
+
+        # Create button — disabled when range is invalid
         row = box.row()
         row.scale_y = 1.4
-        row.enabled = fend > fstart
+        row.enabled = dur > 0
         row.operator("multicam.add_camera",
                      text="Add Camera at Current View",
                      icon="CAMERA_DATA")
