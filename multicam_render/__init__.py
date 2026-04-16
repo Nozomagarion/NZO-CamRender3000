@@ -91,6 +91,7 @@ def _save_state(scene):
         "camera":      scene.camera,
         "frame_start": scene.frame_start,
         "frame_end":   scene.frame_end,
+        "window":      bpy.context.window,
         # Save all existing timeline markers
         "markers": [
             (m.name, m.frame, m.camera)
@@ -165,8 +166,14 @@ def _on_render_complete(scene, depsgraph=None):
     _progress["is_running"] = False
     _redraw_running[0]      = False
     _restore_state(scene)
+    should_assemble = scene.multicam_auto_assemble_video
+    window = _render_state.get("window")
     _unregister_handlers()
     print("[MultiCam] All cameras rendered. Done.")
+    if should_assemble:
+        result = _start_assemble_video(scene, window=window)
+        if result != {"FINISHED"}:
+            print("[MultiCam] Auto-assemble could not start.")
 
 
 @bpy.app.handlers.persistent
@@ -392,6 +399,89 @@ class MULTICAM_OT_RenderSequence(Operator):
 _assemble_state: dict = {}
 
 
+def _start_assemble_video(scene, window=None, reporter=None):
+    import os, glob
+
+    abs_path   = bpy.path.abspath(scene.render.filepath)
+    render_dir = abs_path if os.path.isdir(abs_path) else os.path.dirname(abs_path)
+
+    def report(level, message):
+        if reporter:
+            reporter(level, message)
+        print(f"[MultiCam] {message}")
+
+    if not os.path.isdir(render_dir):
+        report({"ERROR"}, f"Render directory not found: {render_dir}")
+        return {"CANCELLED"}
+
+    frame_files = []
+    for ext in ("png", "jpg", "jpeg", "exr", "tif", "tiff", "bmp"):
+        found = sorted(glob.glob(os.path.join(render_dir, f"*.{ext}")))
+        if found:
+            frame_files = found
+            break
+
+    if not frame_files:
+        report({"ERROR"}, f"No image frames found in: {render_dir}")
+        return {"CANCELLED"}
+
+    n = len(frame_files)
+    video_dir  = os.path.join(render_dir, "VIDEO")
+    os.makedirs(video_dir, exist_ok=True)
+    blend_stem = os.path.splitext(bpy.path.basename(bpy.data.filepath))[0] or "assembled"
+
+    tmp = bpy.data.scenes.new("_NZO_assemble_")
+    tmp.render.resolution_x = scene.render.resolution_x
+    tmp.render.resolution_y = scene.render.resolution_y
+    tmp.render.fps          = scene.render.fps
+    tmp.render.fps_base     = scene.render.fps_base
+    tmp.frame_start         = 1
+    tmp.frame_end           = n
+
+    r = tmp.render
+    r.image_settings.media_type          = "VIDEO"
+    r.image_settings.file_format         = "FFMPEG"
+    r.ffmpeg.format                      = scene.multicam_video_container
+    r.ffmpeg.codec                       = scene.multicam_video_codec
+    r.ffmpeg.constant_rate_factor        = scene.multicam_video_quality
+    r.ffmpeg.ffmpeg_preset               = "GOOD"
+    r.ffmpeg.gopsize                     = 18
+    r.ffmpeg.use_max_b_frames            = False
+    r.ffmpeg.audio_codec                 = "NONE"
+    r.use_sequencer                      = True
+    r.filepath                           = os.path.join(video_dir, blend_stem)
+
+    seq   = tmp.sequence_editor_create()
+    strip = seq.strips.new_image(
+        name        = "frames",
+        filepath    = frame_files[0],
+        channel     = 1,
+        frame_start = 1,
+    )
+    for f in frame_files[1:]:
+        strip.elements.append(os.path.basename(f))
+
+    _assemble_state.clear()
+    _assemble_state.update({
+        "window":         window,
+        "original_scene": scene,
+        "tmp_scene":      tmp,
+        "video_dir":      video_dir,
+    })
+
+    if _on_assemble_complete not in bpy.app.handlers.render_complete:
+        bpy.app.handlers.render_complete.append(_on_assemble_complete)
+    if _on_assemble_cancel not in bpy.app.handlers.render_cancel:
+        bpy.app.handlers.render_cancel.append(_on_assemble_cancel)
+
+    if window:
+        window.scene = tmp
+    bpy.app.timers.register(_launch_assemble_render, first_interval=0.15)
+
+    report({"INFO"}, f"Assembling {n} frames -> VIDEO/{blend_stem}")
+    return {"FINISHED"}
+
+
 def _cleanup_assembly():
     window = _assemble_state.get("window")
     orig   = _assemble_state.get("original_scene")
@@ -432,6 +522,8 @@ def _launch_assemble_render():
     if window:
         with bpy.context.temp_override(window=window):
             bpy.ops.render.render("INVOKE_DEFAULT", animation=True)
+    else:
+        bpy.ops.render.render("INVOKE_DEFAULT", animation=True)
     return None
 
 
@@ -451,6 +543,11 @@ class MULTICAM_OT_AssembleVideo(Operator):
     )
 
     def execute(self, context):
+        return _start_assemble_video(
+            context.scene,
+            window=context.window,
+            reporter=self.report,
+        )
         import os, glob
 
         scene      = context.scene
@@ -775,6 +872,8 @@ class MULTICAM_PT_MainPanel(Panel):
         row.operator("multicam.render_sequence",
                      text="Render Selected Cameras",
                      icon="RENDER_ANIMATION")
+        layout.prop(scene, "multicam_auto_assemble_video",
+                    text="Auto Assemble Frames to Video")
 
         layout.separator()
 
@@ -871,6 +970,11 @@ def register():
         ],
         default="PERC_LOSSLESS",
     )
+    bpy.types.Scene.multicam_auto_assemble_video = BoolProperty(
+        name="Auto Assemble Frames to Video",
+        description="Automatically assemble the rendered frames into a video after the batch render finishes",
+        default=False,
+    )
 
 
 def unregister():
@@ -885,6 +989,7 @@ def unregister():
     del bpy.types.Scene.multicam_video_container
     del bpy.types.Scene.multicam_video_codec
     del bpy.types.Scene.multicam_video_quality
+    del bpy.types.Scene.multicam_auto_assemble_video
 
 
 if __name__ == "__main__":
