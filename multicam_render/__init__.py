@@ -431,11 +431,11 @@ class MULTICAM_OT_AddCamera(Operator):
 # ──────────────────────────────────────────────────────────────
 
 class MULTICAM_PT_MainPanel(Panel):
-    bl_label       = "Multi-Camera Render"
+    bl_label       = "NZO CamRender3000"
     bl_idname      = "MULTICAM_PT_main_panel"
     bl_space_type  = "VIEW_3D"
     bl_region_type = "UI"
-    bl_category    = "MultiCam"
+    bl_category    = "NZO CamRender"
 
     def draw(self, context):
         try:
