@@ -375,6 +375,171 @@ class MULTICAM_OT_RenderSequence(Operator):
 
 
 # ──────────────────────────────────────────────────────────────
+#  Video assembly — state + handlers
+# ──────────────────────────────────────────────────────────────
+
+_assemble_state: dict = {}   # holds window / scene refs during assembly
+
+
+def _cleanup_assembly():
+    """Restore window scene and delete the temporary assembly scene."""
+    window = _assemble_state.get("window")
+    orig   = _assemble_state.get("original_scene")
+    tmp    = _assemble_state.get("tmp_scene")
+
+    if window and orig and orig.name in bpy.data.scenes:
+        window.scene = orig
+    if tmp and tmp.name in bpy.data.scenes:
+        bpy.data.scenes.remove(tmp)
+
+    for lst, fn in (
+        (bpy.app.handlers.render_complete, _on_assemble_complete),
+        (bpy.app.handlers.render_cancel,   _on_assemble_cancel),
+    ):
+        if fn in lst:
+            lst.remove(fn)
+
+    vdir = _assemble_state.get("video_dir", "")
+    _assemble_state.clear()
+    return vdir
+
+
+@bpy.app.handlers.persistent
+def _on_assemble_complete(scene, depsgraph=None):
+    """Fires when the FFmpeg encoding job finishes."""
+    if scene.name != "_NZO_assemble_":
+        return
+    vdir = _cleanup_assembly()
+    print(f"[MultiCam] Video assembled → {vdir}")
+
+
+@bpy.app.handlers.persistent
+def _on_assemble_cancel(scene, depsgraph=None):
+    """Fires if the user presses Esc during encoding."""
+    if scene.name != "_NZO_assemble_":
+        return
+    _cleanup_assembly()
+    print("[MultiCam] Video assembly cancelled.")
+
+
+def _launch_assemble_render():
+    """Timer callback: called 150 ms after scene switch so Blender
+    has time to make the temp scene active before the render starts."""
+    window = _assemble_state.get("window")
+    if window:
+        with bpy.context.temp_override(window=window):
+            bpy.ops.render.render("INVOKE_DEFAULT", animation=True)
+    return None   # single-shot timer
+
+
+# ──────────────────────────────────────────────────────────────
+#  Operator: Assemble rendered frames → Matroska H.264 video
+# ──────────────────────────────────────────────────────────────
+
+class MULTICAM_OT_AssembleVideo(Operator):
+    """Read all rendered image frames from the output folder and
+    encode them into a single Matroska H.264 video file saved in a
+    VIDEO/ subfolder next to the frames."""
+
+    bl_idname      = "multicam.assemble_video"
+    bl_label       = "Assemble to Video"
+    bl_description = (
+        "Encode rendered frames to Matroska H.264 (perceptually lossless) "
+        "in a VIDEO/ subfolder of the current render output path"
+    )
+
+    def execute(self, context):
+        import os, glob
+
+        scene    = context.scene
+        abs_path = bpy.path.abspath(scene.render.filepath)
+
+        # Resolve render directory (filepath can be a dir or a prefix)
+        render_dir = abs_path if os.path.isdir(abs_path) else os.path.dirname(abs_path)
+
+        if not os.path.isdir(render_dir):
+            self.report({"ERROR"}, f"Render directory not found: {render_dir}")
+            return {"CANCELLED"}
+
+        # ── Find rendered frames (first matching extension wins) ─
+        frame_files = []
+        for ext in ("png", "jpg", "jpeg", "exr", "tif", "tiff", "bmp"):
+            found = sorted(glob.glob(os.path.join(render_dir, f"*.{ext}")))
+            if found:
+                frame_files = found
+                break
+
+        if not frame_files:
+            self.report({"ERROR"}, f"No image frames found in: {render_dir}")
+            return {"CANCELLED"}
+
+        n = len(frame_files)
+
+        # ── Create VIDEO/ output subdirectory ────────────────────
+        video_dir = os.path.join(render_dir, "VIDEO")
+        os.makedirs(video_dir, exist_ok=True)
+
+        # ── Build a temporary Blender scene for encoding ─────────
+        # We never touch the user's current scene or its VSE.
+        tmp = bpy.data.scenes.new("_NZO_assemble_")
+        tmp.render.resolution_x = scene.render.resolution_x
+        tmp.render.resolution_y = scene.render.resolution_y
+        tmp.render.fps          = scene.render.fps
+        tmp.render.fps_base     = scene.render.fps_base
+        tmp.frame_start = 1
+        tmp.frame_end   = n
+
+        # ── FFmpeg output — exact settings from the screenshot ───
+        r = tmp.render
+        r.image_settings.file_format     = "FFMPEG"
+        r.ffmpeg.format                  = "MKV"          # Matroska
+        r.ffmpeg.codec                   = "H264"
+        r.ffmpeg.color_depth             = "8"
+        r.ffmpeg.constant_rate_factor    = "PERCEPTUALLY_LOSSLESS"
+        r.ffmpeg.ffmpeg_preset           = "GOOD"
+        r.ffmpeg.gopsize                 = 18             # Keyframe interval
+        r.ffmpeg.use_max_b_frames        = False
+        r.ffmpeg.audio_codec             = "NONE"
+        r.use_sequencer                  = True           # render VSE, not 3D
+        r.filepath                       = os.path.join(video_dir, "assembled")
+
+        # ── Load frames into the temp scene's VSE ────────────────
+        seq   = tmp.sequence_editor_create()
+        strip = seq.sequences.new_image(
+            name       = "frames",
+            filepath   = frame_files[0],
+            channel    = 1,
+            frame_start= 1,
+        )
+        for f in frame_files[1:]:
+            strip.elements.append(os.path.basename(f))
+
+        # ── Store refs for the completion handler ─────────────────
+        _assemble_state.clear()
+        _assemble_state.update({
+            "window":          context.window,
+            "original_scene":  scene,
+            "tmp_scene":       tmp,
+            "video_dir":       video_dir,
+        })
+
+        # ── Register handlers ────────────────────────────────────
+        if _on_assemble_complete not in bpy.app.handlers.render_complete:
+            bpy.app.handlers.render_complete.append(_on_assemble_complete)
+        if _on_assemble_cancel not in bpy.app.handlers.render_cancel:
+            bpy.app.handlers.render_cancel.append(_on_assemble_cancel)
+
+        # ── Switch active window scene then launch encoding ──────
+        # A short timer delay lets Blender register the scene change
+        # before the render operator is invoked.
+        context.window.scene = tmp
+        bpy.app.timers.register(_launch_assemble_render, first_interval=0.15)
+
+        self.report({"INFO"}, f"Assembling {n} frames → {video_dir}/assembled.mkv")
+        return {"FINISHED"}
+
+
+# ──────────────────────────────────────────────────────────────
 #  Operator: Create camera at current viewport view
 # ──────────────────────────────────────────────────────────────
 
@@ -584,12 +749,29 @@ class MULTICAM_PT_MainPanel(Panel):
                      icon="RENDER_ANIMATION")
 
         layout.separator()
+
+        # ── ASSEMBLE VIDEO section ──────────────────────────────
         box = layout.box()
-        box.label(text="Output path:")
+        box.label(text="Assemble to Video", icon="FILE_MOVIE")
+
+        col = box.column(align=True)
+        col.label(text="Container : Matroska  |  Codec : H.264")
+        col.label(text="Quality : Perceptually Lossless  |  8-bit")
+
+        row = box.row()
+        row.scale_y = 1.4
+        row.operator("multicam.assemble_video",
+                     text="Assemble Frames to Video",
+                     icon="FILE_MOVIE")
+
+        # Output path info
+        layout.separator()
+        box2 = layout.box()
+        box2.label(text="Render output path:")
         try:
-            box.label(text=bpy.path.abspath(scene.render.filepath))
+            box2.label(text=bpy.path.abspath(scene.render.filepath))
         except Exception:
-            box.label(text=scene.render.filepath)
+            box2.label(text=scene.render.filepath)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -600,6 +782,7 @@ _CLASSES = (
     CameraRenderItem,
     MULTICAM_UL_CameraList,
     MULTICAM_OT_RefreshCameras,
+    MULTICAM_OT_AssembleVideo,
     MULTICAM_OT_AddCamera,
     MULTICAM_OT_RenderSequence,
     MULTICAM_PT_MainPanel,
