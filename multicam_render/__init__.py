@@ -501,7 +501,8 @@ class MULTICAM_OT_AssembleVideo(Operator):
         r.ffmpeg.use_max_b_frames        = False
         r.ffmpeg.audio_codec             = "NONE"
         r.use_sequencer                  = True           # render VSE, not 3D
-        r.filepath                       = os.path.join(video_dir, "assembled")
+        blend_stem = os.path.splitext(bpy.path.basename(bpy.data.filepath))[0] or "assembled"
+        r.filepath                       = os.path.join(video_dir, blend_stem)
 
         # ── Load frames into the temp scene's VSE ────────────────
         seq   = tmp.sequence_editor_create()
@@ -535,7 +536,7 @@ class MULTICAM_OT_AssembleVideo(Operator):
         context.window.scene = tmp
         bpy.app.timers.register(_launch_assemble_render, first_interval=0.15)
 
-        self.report({"INFO"}, f"Assembling {n} frames → {video_dir}/assembled.mkv")
+        self.report({"INFO"}, f"Assembling {n} frames → {video_dir}/{blend_stem}.mkv")
         return {"FINISHED"}
 
 
