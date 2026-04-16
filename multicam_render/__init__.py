@@ -391,7 +391,9 @@ class MULTICAM_OT_AddCamera(Operator):
     )
 
     def execute(self, context):
-        scene = context.scene
+        import mathutils
+
+        scene  = context.scene
         fstart = scene.multicam_new_cam_start
         fend   = scene.multicam_new_cam_end
 
@@ -402,20 +404,37 @@ class MULTICAM_OT_AddCamera(Operator):
             return {"CANCELLED"}
 
         # ── Remember current state ──────────────────────────────
-        original_frame    = scene.frame_current
-        original_camera   = scene.camera
-        original_active   = context.view_layer.objects.active
-        original_selected = list(context.selected_objects)
+        original_frame = scene.frame_current
 
-        # ── Deselect all then create camera aligned to viewport ─
+        # ── Find currently selected camera in the list ──────────
+        col          = scene.multicam_cameras
+        idx          = scene.multicam_active_index
+        ref_cam      = None
+        if 0 <= idx < len(col):
+            ref_cam = bpy.data.objects.get(col[idx].cam_name)
+
+        # ── Create camera: behind selected cam or from viewport ─
         bpy.ops.object.select_all(action='DESELECT')
-        bpy.ops.object.camera_add(align='VIEW')
 
-        cam_obj = context.active_object   # the newly created camera
+        if ref_cam is not None:
+            # Place the new camera just behind the selected one.
+            # Cameras look in their local -Z direction; "behind" them
+            # is +Z in local space (away from what they're filming).
+            mat      = ref_cam.matrix_world
+            # 0.5 units back along the camera's optical axis
+            backward = mat.to_3x3() @ mathutils.Vector((0.0, 0.0, 0.5))
+            new_loc  = mat.translation + backward
+            new_rot  = ref_cam.rotation_euler.copy()
+            bpy.ops.object.camera_add(
+                align='WORLD',
+                location=(new_loc.x, new_loc.y, new_loc.z),
+                rotation=(new_rot.x, new_rot.y, new_rot.z),
+            )
+        else:
+            # No camera selected — fall back to current viewport angle
+            bpy.ops.object.camera_add(align='VIEW')
 
-        # ── Auto-name by next available slot ───────────────────
-        existing = {o.name for o in bpy.data.objects if o.type == 'CAMERA'}
-        # camera_add already gave it a default name; keep it as-is
+        cam_obj  = context.active_object
         cam_name = cam_obj.name
 
         # ── Insert keyframe at start frame (location + rotation) ─
