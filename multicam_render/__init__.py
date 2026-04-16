@@ -28,7 +28,7 @@ bl_info = {
 
 import bpy
 from bpy.props import (StringProperty, BoolProperty,
-                       CollectionProperty, IntProperty)
+                       CollectionProperty, IntProperty, EnumProperty)
 from bpy.types import PropertyGroup, UIList, Operator, Panel
 
 
@@ -484,9 +484,9 @@ class MULTICAM_OT_AssembleVideo(Operator):
         r = tmp.render
         r.image_settings.media_type          = "VIDEO"
         r.image_settings.file_format         = "FFMPEG"
-        r.ffmpeg.format                      = "MKV"
-        r.ffmpeg.codec                       = "H264"
-        r.ffmpeg.constant_rate_factor        = "PERC_LOSSLESS"
+        r.ffmpeg.format                      = scene.multicam_video_container
+        r.ffmpeg.codec                       = scene.multicam_video_codec
+        r.ffmpeg.constant_rate_factor        = scene.multicam_video_quality
         r.ffmpeg.ffmpeg_preset               = "GOOD"
         r.ffmpeg.gopsize                     = 18
         r.ffmpeg.use_max_b_frames            = False
@@ -773,8 +773,9 @@ class MULTICAM_PT_MainPanel(Panel):
         box.label(text="Assemble to Video", icon="FILE_MOVIE")
 
         col = box.column(align=True)
-        col.label(text="Container : Matroska  |  Codec : H.264")
-        col.label(text="Quality : Perceptually Lossless  |  8-bit")
+        col.prop(scene, "multicam_video_container", text="Container")
+        col.prop(scene, "multicam_video_codec",     text="Codec")
+        col.prop(scene, "multicam_video_quality",   text="Quality")
 
         row = box.row()
         row.scale_y = 1.4
@@ -828,6 +829,38 @@ def register():
         description="Last frame of the new camera's render range",
         default=60, min=0,
     )
+    bpy.types.Scene.multicam_video_container = EnumProperty(
+        name="Container",
+        items=[
+            ("MKV",       "Matroska (.mkv)", ""),
+            ("MPEG4",     "MP4 (.mp4)",      ""),
+            ("AVI",       "AVI (.avi)",      ""),
+            ("QUICKTIME", "QuickTime (.mov)",""),
+        ],
+        default="MKV",
+    )
+    bpy.types.Scene.multicam_video_codec = EnumProperty(
+        name="Codec",
+        items=[
+            ("H264", "H.264",  ""),
+            ("HEVC", "H.265",  ""),
+            ("VP9",  "VP9",    ""),
+            ("AV1",  "AV1",    ""),
+        ],
+        default="H264",
+    )
+    bpy.types.Scene.multicam_video_quality = EnumProperty(
+        name="Quality",
+        items=[
+            ("PERC_LOSSLESS", "Perceptually Lossless", ""),
+            ("LOSSLESS",      "Lossless",               ""),
+            ("HIGH",          "High",                   ""),
+            ("MEDIUM",        "Medium",                 ""),
+            ("LOW",           "Low",                    ""),
+            ("VERYLOW",       "Very Low",               ""),
+        ],
+        default="PERC_LOSSLESS",
+    )
 
 
 def unregister():
@@ -839,6 +872,9 @@ def unregister():
     del bpy.types.Scene.multicam_active_index
     del bpy.types.Scene.multicam_new_cam_start
     del bpy.types.Scene.multicam_new_cam_end
+    del bpy.types.Scene.multicam_video_container
+    del bpy.types.Scene.multicam_video_codec
+    del bpy.types.Scene.multicam_video_quality
 
 
 if __name__ == "__main__":
