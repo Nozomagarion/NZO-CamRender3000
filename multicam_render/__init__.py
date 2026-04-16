@@ -50,6 +50,7 @@ _progress = {
 }
 
 _redraw_running = [False]  # whether the redraw timer is active
+_range_sync_guard = [False]
 
 # ──────────────────────────────────────────────────────────────
 #  Parallel render — subprocess script + state
@@ -275,11 +276,60 @@ def _update_cam_range_from_selection(self, context):
     except Exception:
         pass
 
-    fmin, fmax = get_keyframe_range(cam_obj)
-    if fmin is not None:
-        duration = fmax - fmin
-        self.multicam_new_cam_start = fmax + 1
-        self.multicam_new_cam_end   = fmax + 1 + duration
+    _range_sync_guard[0] = True
+    try:
+        fmin, fmax = get_keyframe_range(cam_obj)
+        if fmin is not None:
+            duration = fmax - fmin
+            self.multicam_new_cam_start = fmax + 1
+            self.multicam_new_cam_end   = fmax + 1 + duration
+        elif self.multicam_new_cam_start <= 0:
+            self.multicam_new_cam_start = context.scene.frame_start
+    finally:
+        _range_sync_guard[0] = False
+
+
+def _apply_range_to_selected_camera(scene, context):
+    if _range_sync_guard[0]:
+        return
+
+    col = scene.multicam_cameras
+    idx = scene.multicam_active_index
+    if not (0 <= idx < len(col)):
+        return
+
+    cam_obj = bpy.data.objects.get(col[idx].cam_name)
+    if cam_obj is None:
+        return
+
+    fstart = scene.multicam_new_cam_start
+    fend   = scene.multicam_new_cam_end
+
+    if fstart <= 0:
+        fstart = scene.frame_start
+        _range_sync_guard[0] = True
+        try:
+            scene.multicam_new_cam_start = fstart
+        finally:
+            _range_sync_guard[0] = False
+    if fend <= fstart:
+        return
+
+    original_frame = scene.frame_current
+    try:
+        scene.frame_set(fstart)
+        cam_obj.keyframe_insert(data_path="location", frame=fstart)
+        cam_obj.keyframe_insert(data_path="rotation_euler", frame=fstart)
+
+        scene.frame_set(fend)
+        cam_obj.keyframe_insert(data_path="location", frame=fend)
+        cam_obj.keyframe_insert(data_path="rotation_euler", frame=fend)
+    finally:
+        scene.frame_set(original_frame)
+
+
+def _update_selected_camera_range(self, context):
+    _apply_range_to_selected_camera(self, context)
 
 
 def _restore_state(scene):
@@ -1163,6 +1213,97 @@ class MULTICAM_OT_AddCamera(Operator):
 #  Panel — N-Panel › MultiCam tab
 # ──────────────────────────────────────────────────────────────
 
+class MULTICAM_OT_KeySelectedCamera(Operator):
+    """Align the selected camera to the current viewport and insert
+    static keys at the chosen start/end frames."""
+
+    bl_idname      = "multicam.key_selected_camera"
+    bl_label       = "Key Selected Camera"
+    bl_description = (
+        "Use the current viewport view for the selected camera and "
+        "insert location/rotation keys on the chosen frame range"
+    )
+
+    def execute(self, context):
+        scene  = context.scene
+        fstart = scene.multicam_new_cam_start
+        fend   = scene.multicam_new_cam_end
+        rf_min, rf_max = (None, None)
+
+        col = scene.multicam_cameras
+        idx = scene.multicam_active_index
+        if not (0 <= idx < len(col)):
+            self.report({"ERROR"}, "Select a camera in the list first.")
+            return {"CANCELLED"}
+
+        cam_obj = bpy.data.objects.get(col[idx].cam_name)
+        if cam_obj is None:
+            self.report({"ERROR"}, "Selected camera was not found.")
+            return {"CANCELLED"}
+
+        rf_min, rf_max = get_keyframe_range(cam_obj)
+        if rf_min is None and fstart <= 0:
+            fstart = scene.frame_start
+        elif rf_min is not None and fstart < rf_min:
+            fstart = rf_min
+
+        if fend <= fstart:
+            self.report({"ERROR"},
+                        f"End frame ({fend}) must be greater than start frame ({fstart}).")
+            return {"CANCELLED"}
+
+        scene.multicam_new_cam_start = fstart
+
+        area = next((a for a in context.screen.areas if a.type == "VIEW_3D"), None)
+        if area is None:
+            self.report({"ERROR"}, "No 3D View found to capture the current viewport.")
+            return {"CANCELLED"}
+
+        region = next((r for r in area.regions if r.type == "WINDOW"), None)
+        space = next((s for s in area.spaces if s.type == "VIEW_3D"), None)
+        if region is None or space is None:
+            self.report({"ERROR"}, "Could not access the current 3D viewport.")
+            return {"CANCELLED"}
+
+        original_frame = scene.frame_current
+        original_scene_camera = scene.camera
+        original_active = context.view_layer.objects.active
+        original_selection = list(context.selected_objects)
+
+        try:
+            for obj in original_selection:
+                obj.select_set(False)
+            cam_obj.select_set(True)
+            context.view_layer.objects.active = cam_obj
+            scene.camera = cam_obj
+
+            with context.temp_override(area=area, region=region, space_data=space):
+                bpy.ops.view3d.camera_to_view()
+
+            scene.frame_set(fstart)
+            cam_obj.keyframe_insert(data_path="location", frame=fstart)
+            cam_obj.keyframe_insert(data_path="rotation_euler", frame=fstart)
+
+            scene.frame_set(fend)
+            cam_obj.keyframe_insert(data_path="location", frame=fend)
+            cam_obj.keyframe_insert(data_path="rotation_euler", frame=fend)
+        finally:
+            scene.frame_set(original_frame)
+            scene.camera = original_scene_camera
+            for obj in context.selected_objects:
+                obj.select_set(False)
+            for obj in original_selection:
+                if obj and obj.name in bpy.data.objects:
+                    obj.select_set(True)
+            if original_active and original_active.name in bpy.data.objects:
+                context.view_layer.objects.active = original_active
+
+        bpy.ops.multicam.refresh_cameras()
+        self.report({"INFO"},
+                    f"Camera '{cam_obj.name}' keyed â€” frames {fstart}â€“{fend}.")
+        return {"FINISHED"}
+
+
 class MULTICAM_PT_MainPanel(Panel):
     bl_label       = "NZO CamRender3000"
     bl_idname      = "MULTICAM_PT_main_panel"
@@ -1299,7 +1440,7 @@ class MULTICAM_PT_MainPanel(Panel):
 
         # ── New camera range (editable) ─────────────────────────
         row_new = col_info.row(align=True)
-        row_new.label(text="New cam  ", icon="ADD")
+        row_new.label(text="Range  ", icon="KEY_HLT")
         sub = row_new.row(align=True)
         sub.prop(scene, "multicam_new_cam_start", text="")
         sub.label(text="→")
@@ -1320,6 +1461,13 @@ class MULTICAM_PT_MainPanel(Panel):
         row.operator("multicam.add_camera",
                      text="Add Camera at Current View",
                      icon="CAMERA_DATA")
+
+        row = box.row()
+        row.scale_y = 1.2
+        row.enabled = dur > 0 and ref_cam is not None
+        row.operator("multicam.key_selected_camera",
+                     text="Key Selected Camera at Current View",
+                     icon="KEY_HLT")
 
         layout.separator()
 
@@ -1480,6 +1628,7 @@ _CLASSES = (
     MULTICAM_OT_GenerateThumbnails,
     MULTICAM_OT_RenderParallel,
     MULTICAM_OT_AddCamera,
+    MULTICAM_OT_KeySelectedCamera,
     MULTICAM_OT_RenderSequence,
     MULTICAM_PT_MainPanel,
     MULTICAM_PT_HistoryPanel,
@@ -1504,11 +1653,13 @@ def register():
         name="Start Frame",
         description="First frame of the new camera's render range",
         default=0, min=0,
+        update=_update_selected_camera_range,
     )
     bpy.types.Scene.multicam_new_cam_end = IntProperty(
         name="End Frame",
         description="Last frame of the new camera's render range",
         default=60, min=0,
+        update=_update_selected_camera_range,
     )
     bpy.types.Scene.multicam_video_container = EnumProperty(
         name="Container",
