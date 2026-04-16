@@ -50,6 +50,13 @@ _progress = {
 
 _redraw_running = [False]  # whether the redraw timer is active
 
+# Extra live stats updated by the redraw timer
+_render_stats = {
+    "elapsed_s": 0.0,
+    "eta_s":     None,   # None = not enough data yet
+    "fps":       0.0,    # frames per second
+}
+
 
 # ──────────────────────────────────────────────────────────────
 #  Render history helpers
@@ -300,9 +307,26 @@ def _unregister_handlers():
 # ──────────────────────────────────────────────────────────────
 
 def _redraw_tick():
-    """Called every 0.4 s while rendering to refresh the panel."""
+    """Called every 0.4 s while rendering to refresh the panel and update ETA."""
     if not _redraw_running[0]:
         return None  # return None → timer stops
+
+    # ── Update live stats ───────────────────────────────────────
+    start = _render_state.get("start_time")
+    if start:
+        elapsed = _time.time() - start
+        done    = _progress["rendered_frames"]
+        total   = _progress["total_frames"]
+        _render_stats["elapsed_s"] = elapsed
+        if done > 0 and elapsed > 0:
+            fps = done / elapsed
+            _render_stats["fps"] = fps
+            remaining = total - done
+            _render_stats["eta_s"] = remaining / fps if fps > 0 else None
+        else:
+            _render_stats["fps"]   = 0.0
+            _render_stats["eta_s"] = None
+
     try:
         for window in bpy.context.window_manager.windows:
             for area in window.screen.areas:
@@ -471,6 +495,7 @@ class MULTICAM_OT_RenderSequence(Operator):
         )
 
         _render_state["start_time"] = _time.time()
+        _render_stats.update({"elapsed_s": 0.0, "eta_s": None, "fps": 0.0})
 
         if window:
             with context.temp_override(window=window):
@@ -868,8 +893,25 @@ class MULTICAM_PT_MainPanel(Panel):
             bar_text = f"{done} / {total} frames"
             col.progress(factor=frac, text=bar_text)
 
+            # ── ETA + speed row ─────────────────────────────────
+            stats = _render_stats
+            eta   = stats.get("eta_s")
+            fps   = stats.get("fps", 0.0)
+            elapsed = stats.get("elapsed_s", 0.0)
+
+            row_stats = col.row(align=True)
+            row_stats.label(
+                text=f"Elapsed: {_format_duration(elapsed)}",
+                icon="TIME",
+            )
+            if eta is not None:
+                row_stats.label(text=f"ETA: {_format_duration(eta)}")
+            if fps > 0:
+                col.label(text=f"Speed: {fps:.2f} frames/s", icon="SORTTIME")
+
             # Current camera label
             if prog["current_cam"]:
+                col.separator(factor=0.5)
                 col.label(
                     text=f"Camera : {prog['current_cam']}",
                     icon="CAMERA_DATA",
@@ -879,16 +921,18 @@ class MULTICAM_PT_MainPanel(Panel):
 
             # Per-camera status
             col.label(text="Cameras in sequence:")
+            frames_offset = prog["cameras"][0][1] if prog["cameras"] else 0
             for name, fmin, fmax in prog["cameras"]:
                 row  = col.row(align=True)
-                # Determine icon based on progress
-                if done >= (fmax - prog["cameras"][0][1] + 1):
+                cam_frames_done = fmax - frames_offset + 1
+                if done >= cam_frames_done:
                     ico = "CHECKMARK"
                 elif prog["current_cam"] == name:
                     ico = "RENDER_ANIMATION"
                 else:
                     ico = "TIME"
-                row.label(text=f"{name}  ({fmin}–{fmax})", icon=ico)
+                dur = fmax - fmin
+                row.label(text=f"{name}  ({dur + 1} fr)", icon=ico)
 
             col.separator()
             col.label(text="Press Esc in render window to cancel.",
