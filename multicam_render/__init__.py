@@ -486,7 +486,7 @@ class MULTICAM_OT_AssembleVideo(Operator):
         r.image_settings.file_format         = "FFMPEG"
         r.ffmpeg.format                      = "MKV"
         r.ffmpeg.codec                       = "H264"
-        r.ffmpeg.constant_rate_factor        = "PERCEPTUALLY_LOSSLESS"
+        r.ffmpeg.constant_rate_factor        = "PERC_LOSSLESS"
         r.ffmpeg.ffmpeg_preset               = "GOOD"
         r.ffmpeg.gopsize                     = 18
         r.ffmpeg.use_max_b_frames            = False
