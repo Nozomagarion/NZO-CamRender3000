@@ -27,6 +27,7 @@ bl_info = {
 }
 
 import bpy
+import time as _time
 from bpy.props import (StringProperty, BoolProperty,
                        CollectionProperty, IntProperty, EnumProperty)
 from bpy.types import PropertyGroup, UIList, Operator, Panel
@@ -48,6 +49,54 @@ _progress = {
 }
 
 _redraw_running = [False]  # whether the redraw timer is active
+
+
+# ──────────────────────────────────────────────────────────────
+#  Render history helpers
+# ──────────────────────────────────────────────────────────────
+
+def _history_path():
+    """JSON file sitting next to the .blend, or in the system temp dir."""
+    import os
+    blend = bpy.data.filepath
+    if blend:
+        return os.path.splitext(blend)[0] + "_render_history.json"
+    import tempfile
+    return os.path.join(tempfile.gettempdir(), "nzo_render_history.json")
+
+
+def _load_history():
+    import json, os
+    path = _history_path()
+    if not os.path.isfile(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+def _append_history(entry):
+    import json
+    entries = _load_history()
+    entries.append(entry)
+    try:
+        with open(_history_path(), "w", encoding="utf-8") as f:
+            json.dump(entries[-20:], f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"[MultiCam] Could not save history: {e}")
+
+
+def _format_duration(seconds):
+    s = int(seconds)
+    if s < 60:
+        return f"{s}s"
+    m, s = divmod(s, 60)
+    if m < 60:
+        return f"{m}m {s:02d}s"
+    h, m = divmod(m, 60)
+    return f"{h}h {m:02d}m"
 
 
 # ──────────────────────────────────────────────────────────────
@@ -163,6 +212,13 @@ def _on_render_post(scene, depsgraph=None):
 @bpy.app.handlers.persistent
 def _on_render_complete(scene, depsgraph=None):
     """Fires when the full animation render job completes."""
+    import datetime
+    elapsed      = _time.time() - _render_state.get("start_time", _time.time())
+    cameras_snap = list(_progress["cameras"])
+    total_frames = _progress["total_frames"]
+    resolution   = f"{scene.render.resolution_x}×{scene.render.resolution_y}"
+    output_path  = bpy.path.abspath(scene.render.filepath)
+
     _progress["is_running"] = False
     _redraw_running[0]      = False
     _restore_state(scene)
@@ -170,6 +226,18 @@ def _on_render_complete(scene, depsgraph=None):
     window = _render_state.get("window")
     _unregister_handlers()
     print("[MultiCam] All cameras rendered. Done.")
+
+    _append_history({
+        "timestamp":       datetime.datetime.now().isoformat(timespec="seconds"),
+        "status":          "completed",
+        "duration_s":      round(elapsed, 1),
+        "total_frames":    total_frames,
+        "rendered_frames": total_frames,
+        "resolution":      resolution,
+        "output_path":     output_path,
+        "cameras":         [{"name": n, "frames": f"{a}–{b}"} for n, a, b in cameras_snap],
+    })
+
     if should_assemble:
         result = _start_assemble_video(scene, window=window)
         if result != {"FINISHED"}:
@@ -179,11 +247,30 @@ def _on_render_complete(scene, depsgraph=None):
 @bpy.app.handlers.persistent
 def _on_render_cancel(scene, depsgraph=None):
     """Fires if the user cancels the render."""
+    import datetime
+    elapsed       = _time.time() - _render_state.get("start_time", _time.time())
+    cameras_snap  = list(_progress["cameras"])
+    frames_done   = _progress["rendered_frames"]
+    total_frames  = _progress["total_frames"]
+    resolution    = f"{scene.render.resolution_x}×{scene.render.resolution_y}"
+    output_path   = bpy.path.abspath(scene.render.filepath)
+
     _progress["is_running"] = False
     _redraw_running[0]      = False
     _restore_state(scene)
     _unregister_handlers()
     print("[MultiCam] Render cancelled.")
+
+    _append_history({
+        "timestamp":       datetime.datetime.now().isoformat(timespec="seconds"),
+        "status":          "cancelled",
+        "duration_s":      round(elapsed, 1),
+        "total_frames":    total_frames,
+        "rendered_frames": frames_done,
+        "resolution":      resolution,
+        "output_path":     output_path,
+        "cameras":         [{"name": n, "frames": f"{a}–{b}"} for n, a, b in cameras_snap],
+    })
 
 
 def _register_handlers():
@@ -382,6 +469,8 @@ class MULTICAM_OT_RenderSequence(Operator):
             f"[MultiCam] Starting batch render — "
             f"{len(entries)} camera(s), frames {global_fmin}–{global_fmax}."
         )
+
+        _render_state["start_time"] = _time.time()
 
         if window:
             with context.temp_override(window=window):
@@ -632,6 +721,26 @@ class MULTICAM_OT_AssembleVideo(Operator):
         bpy.app.timers.register(_launch_assemble_render, first_interval=0.15)
 
         self.report({"INFO"}, f"Assembling {n} frames → VIDEO/{blend_stem}.mkv")
+        return {"FINISHED"}
+
+
+# ──────────────────────────────────────────────────────────────
+#  Operator: Clear render history
+# ──────────────────────────────────────────────────────────────
+
+class MULTICAM_OT_ClearHistory(Operator):
+    bl_idname      = "multicam.clear_history"
+    bl_label       = "Clear Render History"
+    bl_description = "Delete the render history file for this project"
+
+    def execute(self, context):
+        import os
+        path = _history_path()
+        if os.path.isfile(path):
+            os.remove(path)
+            self.report({"INFO"}, "Render history cleared.")
+        else:
+            self.report({"INFO"}, "No history file found.")
         return {"FINISHED"}
 
 
@@ -903,6 +1012,63 @@ class MULTICAM_PT_MainPanel(Panel):
 
 
 # ──────────────────────────────────────────────────────────────
+#  Sub-panel: Render History
+# ──────────────────────────────────────────────────────────────
+
+class MULTICAM_PT_HistoryPanel(Panel):
+    bl_label       = "Render History"
+    bl_idname      = "MULTICAM_PT_history_panel"
+    bl_space_type  = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category    = "NZO CamRender"
+    bl_parent_id   = "MULTICAM_PT_main_panel"
+    bl_options     = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout  = self.layout
+        entries = _load_history()
+
+        if not entries:
+            layout.label(text="No renders recorded yet.", icon="INFO")
+            layout.separator()
+            layout.operator("multicam.clear_history",
+                            text="Clear History", icon="TRASH")
+            return
+
+        for entry in reversed(entries[-5:]):
+            box = layout.box()
+
+            # ── Row 1 : timestamp + status + duration ──────────
+            row = box.row()
+            icon = "CHECKMARK" if entry.get("status") == "completed" else "X"
+            ts   = entry.get("timestamp", "")[:16].replace("T", "  ")
+            dur  = _format_duration(entry.get("duration_s", 0))
+            row.label(text=f"{ts}  •  {dur}", icon=icon)
+
+            # ── Row 2 : frames + resolution ────────────────────
+            sub   = box.column(align=True)
+            done  = entry.get("rendered_frames", entry.get("total_frames", 0))
+            total = entry.get("total_frames", 0)
+            res   = entry.get("resolution", "")
+            if entry.get("status") == "cancelled":
+                sub.label(text=f"{done}/{total} frames  •  {res}")
+            else:
+                sub.label(text=f"{total} frames  •  {res}")
+
+            # ── Row 3 : camera names ────────────────────────────
+            cams = entry.get("cameras", [])
+            if cams:
+                names = ", ".join(c["name"] for c in cams)
+                if len(names) > 42:
+                    names = names[:39] + "..."
+                sub.label(text=names, icon="CAMERA_DATA")
+
+        layout.separator()
+        layout.operator("multicam.clear_history",
+                        text="Clear History", icon="TRASH")
+
+
+# ──────────────────────────────────────────────────────────────
 #  Registration
 # ──────────────────────────────────────────────────────────────
 
@@ -911,9 +1077,11 @@ _CLASSES = (
     MULTICAM_UL_CameraList,
     MULTICAM_OT_RefreshCameras,
     MULTICAM_OT_AssembleVideo,
+    MULTICAM_OT_ClearHistory,
     MULTICAM_OT_AddCamera,
     MULTICAM_OT_RenderSequence,
     MULTICAM_PT_MainPanel,
+    MULTICAM_PT_HistoryPanel,
 )
 
 
