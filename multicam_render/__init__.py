@@ -99,6 +99,23 @@ def _save_state(scene):
     })
 
 
+def _update_cam_range_from_selection(self, context):
+    """Called when the active index in the UIList changes.
+    Reads the selected camera's keyframe range and writes it
+    into the Create Camera Start / End fields."""
+    col = self.multicam_cameras       # self = Scene
+    idx = self.multicam_active_index
+    if not (0 <= idx < len(col)):
+        return
+    cam_obj = bpy.data.objects.get(col[idx].cam_name)
+    if cam_obj is None:
+        return
+    fmin, fmax = get_keyframe_range(cam_obj)
+    if fmin is not None:
+        self.multicam_new_cam_start = fmin
+        self.multicam_new_cam_end   = fmax
+
+
 def _restore_state(scene):
     if not _render_state:
         return
@@ -577,7 +594,9 @@ def register():
         type=CameraRenderItem, name="MultiCam Cameras",
     )
     bpy.types.Scene.multicam_active_index = IntProperty(
-        name="Active Camera Index", default=0,
+        name="Active Camera Index",
+        default=0,
+        update=_update_cam_range_from_selection,
     )
     bpy.types.Scene.multicam_new_cam_start = IntProperty(
         name="Start Frame",
