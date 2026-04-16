@@ -51,6 +51,59 @@ _progress = {
 
 _redraw_running = [False]  # whether the redraw timer is active
 
+# ──────────────────────────────────────────────────────────────
+#  Parallel render — subprocess script + state
+# ──────────────────────────────────────────────────────────────
+
+# Script written to disk and executed by each background Blender process.
+# Completely self-contained — must not import multicam_render.
+_PARALLEL_RENDER_SCRIPT = r'''
+import bpy, json, sys, os
+
+cfg_path = sys.argv[sys.argv.index("--") + 1]
+with open(cfg_path, "r") as _f:
+    _cfg = json.load(_f)
+
+_status_file = _cfg["status_file"]
+
+def _write(cam, frame, done):
+    try:
+        with open(_status_file, "w") as f:
+            json.dump({"cam": cam, "frame": frame, "done": done}, f)
+    except Exception:
+        pass
+
+scene = bpy.context.scene
+
+for cam_info in _cfg["cameras"]:
+    cam_obj = bpy.data.objects.get(cam_info["name"])
+    if not cam_obj:
+        continue
+    scene.camera      = cam_obj
+    scene.frame_start = cam_info["fmin"]
+    scene.frame_end   = cam_info["fmax"]
+    out_dir = os.path.join(_cfg["output_dir"], cam_info["name"])
+    os.makedirs(out_dir, exist_ok=True)
+    scene.render.filepath = os.path.join(out_dir, "")
+
+    _name = cam_info["name"]
+
+    def _on_post(sc, dg=None, _n=_name):
+        _write(_n, sc.frame_current, False)
+
+    bpy.app.handlers.render_post.append(_on_post)
+    bpy.ops.render.render(animation=True)
+    bpy.app.handlers.render_post.remove(_on_post)
+
+_write("", 0, True)
+'''
+
+_parallel_state: dict = {
+    "is_running": False,
+    "processes":  [],   # list of {proc, status_path, cameras, index}
+    "status":     [],   # list of {cam, frame, done}
+}
+
 # ── Thumbnail preview collection (lazy-initialised in register()) ──
 _preview_coll = None
 
@@ -385,6 +438,41 @@ def _redraw_tick():
 def _start_redraw_timer():
     _redraw_running[0] = True
     bpy.app.timers.register(_redraw_tick, first_interval=0.4)
+
+
+def _parallel_poll_tick():
+    """Polls subprocess status files every second; stops when all done."""
+    if not _parallel_state["is_running"]:
+        return None
+
+    all_done = True
+    for i, pinfo in enumerate(_parallel_state["processes"]):
+        # Read status file written by the subprocess
+        try:
+            import json as _json
+            with open(pinfo["status_path"], "r") as f:
+                _parallel_state["status"][i] = _json.load(f)
+        except Exception:
+            pass
+
+        if pinfo["proc"].poll() is None:
+            all_done = False
+
+    # Redraw VIEW_3D panels
+    try:
+        for window in bpy.context.window_manager.windows:
+            for area in window.screen.areas:
+                if area.type == "VIEW_3D":
+                    area.tag_redraw()
+    except Exception:
+        pass
+
+    if all_done:
+        _parallel_state["is_running"] = False
+        print("[MultiCam] All parallel renders complete.")
+        return None
+
+    return 1.0  # reschedule every second
 
 
 # ──────────────────────────────────────────────────────────────
@@ -799,6 +887,114 @@ class MULTICAM_OT_AssembleVideo(Operator):
 
 
 # ──────────────────────────────────────────────────────────────
+#  Operator: Parallel render (multi-process / multi-GPU)
+# ──────────────────────────────────────────────────────────────
+
+class MULTICAM_OT_RenderParallel(Operator):
+    bl_idname      = "multicam.render_parallel"
+    bl_label       = "Render Parallel"
+    bl_description = (
+        "Launch one Blender background process per job slot, each rendering "
+        "a subset of cameras simultaneously. Save the .blend first."
+    )
+
+    def execute(self, context):
+        import subprocess, tempfile, json, math
+
+        scene = context.scene
+
+        if not bpy.data.filepath:
+            self.report({"ERROR"},
+                        "Save the .blend file before using parallel render.")
+            return {"CANCELLED"}
+
+        if _parallel_state["is_running"]:
+            self.report({"WARNING"}, "A parallel render is already running.")
+            return {"CANCELLED"}
+
+        # ── Collect enabled cameras with valid keyframes ────────
+        entries = []
+        for item in scene.multicam_cameras:
+            if not item.enabled:
+                continue
+            cam_obj = bpy.data.objects.get(item.cam_name)
+            if not cam_obj:
+                continue
+            fmin, fmax = get_keyframe_range(cam_obj)
+            if fmin is None:
+                continue
+            entries.append({"name": item.cam_name, "fmin": fmin, "fmax": fmax})
+
+        if not entries:
+            self.report({"ERROR"}, "No valid cameras to render.")
+            return {"CANCELLED"}
+
+        n_jobs    = min(scene.multicam_parallel_jobs, len(entries))
+        abs_path  = bpy.path.abspath(scene.render.filepath)
+        render_dir = abs_path if os.path.isdir(abs_path) else os.path.dirname(abs_path)
+        tmp_dir    = tempfile.gettempdir()
+        blend_file = bpy.data.filepath
+        blender    = bpy.app.binary_path
+
+        # ── Write the subprocess render script once ─────────────
+        script_path = os.path.join(tmp_dir, "nzo_parallel_render.py")
+        with open(script_path, "w", encoding="utf-8") as f:
+            f.write(_PARALLEL_RENDER_SCRIPT)
+
+        # ── Distribute cameras round-robin across jobs ──────────
+        groups: list = [[] for _ in range(n_jobs)]
+        for i, entry in enumerate(entries):
+            groups[i % n_jobs].append(entry)
+
+        # ── Reset parallel state ────────────────────────────────
+        _parallel_state["is_running"] = True
+        _parallel_state["processes"]  = []
+        _parallel_state["status"]     = []
+
+        # ── Spawn one process per group ─────────────────────────
+        for i, group in enumerate(groups):
+            if not group:
+                continue
+            cfg_path    = os.path.join(tmp_dir, f"nzo_par_cfg_{i}.json")
+            status_path = os.path.join(tmp_dir, f"nzo_par_status_{i}.json")
+
+            with open(cfg_path, "w", encoding="utf-8") as f:
+                json.dump({
+                    "cameras":    group,
+                    "output_dir": render_dir,
+                    "status_file": status_path,
+                }, f)
+
+            proc = subprocess.Popen(
+                [blender, "--background", blend_file,
+                 "--python", script_path, "--", cfg_path],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+            _parallel_state["processes"].append({
+                "proc":        proc,
+                "status_path": status_path,
+                "cameras":     [c["name"] for c in group],
+                "index":       i,
+            })
+            _parallel_state["status"].append({
+                "cam":   group[0]["name"],
+                "frame": 0,
+                "done":  False,
+            })
+
+        bpy.app.timers.register(_parallel_poll_tick, first_interval=1.0)
+
+        self.report(
+            {"INFO"},
+            f"Launched {len(_parallel_state['processes'])} parallel process(es) "
+            f"for {len(entries)} camera(s).",
+        )
+        return {"FINISHED"}
+
+
+# ──────────────────────────────────────────────────────────────
 #  Operator: Generate camera thumbnails
 # ──────────────────────────────────────────────────────────────
 
@@ -986,6 +1182,29 @@ class MULTICAM_PT_MainPanel(Panel):
         scene  = context.scene
         prog   = _progress
 
+        # ── PARALLEL PROGRESS VIEW ──────────────────────────────
+        if _parallel_state["is_running"]:
+            box = layout.box()
+            box.label(text="Parallel Render Running…", icon="RENDER_ANIMATION")
+            col = box.column(align=True)
+            for i, pinfo in enumerate(_parallel_state["processes"]):
+                st   = _parallel_state["status"][i] if i < len(_parallel_state["status"]) else {}
+                done = st.get("done", False)
+                cam  = st.get("cam", "")
+                frm  = st.get("frame", 0)
+                names = ", ".join(pinfo["cameras"])
+                if done:
+                    col.label(text=f"Job {i+1}: ✓ done  ({names})", icon="CHECKMARK")
+                else:
+                    col.label(
+                        text=f"Job {i+1}: {cam}  fr {frm}  |  {names}",
+                        icon="RENDER_STILL",
+                    )
+            col.separator()
+            col.label(text="Renders run in background — Blender stays usable.",
+                      icon="INFO")
+            return
+
         # ── PROGRESS VIEW (shown while rendering) ───────────────
         if prog["is_running"]:
             box = layout.box()
@@ -1139,13 +1358,30 @@ class MULTICAM_PT_MainPanel(Panel):
                         icon="RESTRICT_RENDER_OFF")
 
         layout.separator()
-        row = layout.row()
-        row.scale_y = 1.6
+
+        # ── RENDER section ──────────────────────────────────────
+        box_r = layout.box()
+        box_r.label(text="Render", icon="RENDER_ANIMATION")
+
+        row = box_r.row()
+        row.scale_y = 1.4
         row.operator("multicam.render_sequence",
-                     text="Render Selected Cameras",
+                     text="Render Sequential",
                      icon="RENDER_ANIMATION")
-        layout.prop(scene, "multicam_auto_assemble_video",
-                    text="Auto Assemble Frames to Video")
+        box_r.prop(scene, "multicam_auto_assemble_video",
+                   text="Auto Assemble After Render")
+
+        box_r.separator(factor=0.5)
+
+        row_p = box_r.row(align=True)
+        row_p.prop(scene, "multicam_parallel_jobs", text="Jobs")
+        row_p.operator("multicam.render_parallel",
+                       text="Render Parallel",
+                       icon="WINDOW")
+        box_r.label(
+            text="Parallel: each job = 1 Blender process (GPU/CPU).",
+            icon="INFO",
+        )
 
         layout.separator()
 
@@ -1242,6 +1478,7 @@ _CLASSES = (
     MULTICAM_OT_AssembleVideo,
     MULTICAM_OT_ClearHistory,
     MULTICAM_OT_GenerateThumbnails,
+    MULTICAM_OT_RenderParallel,
     MULTICAM_OT_AddCamera,
     MULTICAM_OT_RenderSequence,
     MULTICAM_PT_MainPanel,
@@ -1310,6 +1547,11 @@ def register():
         description="Automatically assemble the rendered frames into a video after the batch render finishes",
         default=False,
     )
+    bpy.types.Scene.multicam_parallel_jobs = IntProperty(
+        name="Parallel Jobs",
+        description="Number of Blender background processes to launch simultaneously",
+        default=2, min=1, max=8,
+    )
 
 
 def unregister():
@@ -1329,6 +1571,7 @@ def unregister():
     del bpy.types.Scene.multicam_video_codec
     del bpy.types.Scene.multicam_video_quality
     del bpy.types.Scene.multicam_auto_assemble_video
+    del bpy.types.Scene.multicam_parallel_jobs
 
 
 if __name__ == "__main__":
