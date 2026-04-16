@@ -375,111 +375,155 @@ class MULTICAM_OT_RenderSequence(Operator):
 
 
 # ──────────────────────────────────────────────────────────────
+#  Video assembly — state + handlers
+# ──────────────────────────────────────────────────────────────
+
+_assemble_state: dict = {}
+
+
+def _cleanup_assembly():
+    window = _assemble_state.get("window")
+    orig   = _assemble_state.get("original_scene")
+    tmp    = _assemble_state.get("tmp_scene")
+    if window and orig and orig.name in bpy.data.scenes:
+        window.scene = orig
+    if tmp and tmp.name in bpy.data.scenes:
+        bpy.data.scenes.remove(tmp)
+    for lst, fn in (
+        (bpy.app.handlers.render_complete, _on_assemble_complete),
+        (bpy.app.handlers.render_cancel,   _on_assemble_cancel),
+    ):
+        if fn in lst:
+            lst.remove(fn)
+    vdir = _assemble_state.get("video_dir", "")
+    _assemble_state.clear()
+    return vdir
+
+
+@bpy.app.handlers.persistent
+def _on_assemble_complete(scene, depsgraph=None):
+    if scene.name != "_NZO_assemble_":
+        return
+    vdir = _cleanup_assembly()
+    print(f"[MultiCam] Video assembled → {vdir}")
+
+
+@bpy.app.handlers.persistent
+def _on_assemble_cancel(scene, depsgraph=None):
+    if scene.name != "_NZO_assemble_":
+        return
+    _cleanup_assembly()
+    print("[MultiCam] Video assembly cancelled.")
+
+
+def _launch_assemble_render():
+    window = _assemble_state.get("window")
+    if window:
+        with bpy.context.temp_override(window=window):
+            bpy.ops.render.render("INVOKE_DEFAULT", animation=True)
+    return None
+
+
+# ──────────────────────────────────────────────────────────────
 #  Operator: Assemble rendered frames → Matroska H.264 video
-#  Uses system ffmpeg via subprocess — no Blender render API needed
 # ──────────────────────────────────────────────────────────────
 
 class MULTICAM_OT_AssembleVideo(Operator):
-    """Encode all rendered image frames into a Matroska H.264 video
-    in a VIDEO/ subfolder, using system ffmpeg."""
+    """Read all rendered image frames and encode them into a single
+    Matroska H.264 video using Blender's built-in FFmpeg support."""
 
     bl_idname      = "multicam.assemble_video"
     bl_label       = "Assemble to Video"
     bl_description = (
-        "Encode rendered frames to Matroska H.264 (CRF 18, perceptually lossless) "
-        "in a VIDEO/ subfolder — requires ffmpeg in PATH"
+        "Encode rendered frames to Matroska H.264 (perceptually lossless) "
+        "in a VIDEO/ subfolder using Blender's built-in FFmpeg"
     )
 
     def execute(self, context):
-        import os, glob, subprocess, shutil
+        import os, glob
 
-        scene    = context.scene
-        abs_path = bpy.path.abspath(scene.render.filepath)
+        scene      = context.scene
+        abs_path   = bpy.path.abspath(scene.render.filepath)
         render_dir = abs_path if os.path.isdir(abs_path) else os.path.dirname(abs_path)
 
         if not os.path.isdir(render_dir):
             self.report({"ERROR"}, f"Render directory not found: {render_dir}")
             return {"CANCELLED"}
 
-        # ── Find rendered frames (first matching extension wins) ─
+        # ── Find rendered frames ──────────────────────────────────
         frame_files = []
-        ext_used    = "png"
         for ext in ("png", "jpg", "jpeg", "exr", "tif", "tiff", "bmp"):
             found = sorted(glob.glob(os.path.join(render_dir, f"*.{ext}")))
             if found:
                 frame_files = found
-                ext_used    = ext
                 break
 
         if not frame_files:
             self.report({"ERROR"}, f"No image frames found in: {render_dir}")
             return {"CANCELLED"}
 
-        # ── Locate ffmpeg ─────────────────────────────────────────
-        ffmpeg = shutil.which("ffmpeg")
-        if not ffmpeg:
-            # Try next to blender.exe (some custom builds ship it there)
-            blender_dir = os.path.dirname(bpy.app.binary_path)
-            for name in ("ffmpeg.exe", "ffmpeg"):
-                candidate = os.path.join(blender_dir, name)
-                if os.path.isfile(candidate):
-                    ffmpeg = candidate
-                    break
-        if not ffmpeg:
-            self.report({"ERROR"},
-                        "ffmpeg not found. Install ffmpeg and add it to PATH.")
-            return {"CANCELLED"}
-
-        # ── Detect frame numbering pattern ────────────────────────
-        first_stem, first_ext = os.path.splitext(os.path.basename(frame_files[0]))
-        pad = len(first_stem)
-        try:
-            start_num = int(first_stem)
-        except ValueError:
-            start_num = 0
-        pattern = os.path.join(render_dir, f"%0{pad}d{first_ext}")
-
-        fps = scene.render.fps / scene.render.fps_base
+        n = len(frame_files)
 
         # ── Output path ───────────────────────────────────────────
         video_dir  = os.path.join(render_dir, "VIDEO")
         os.makedirs(video_dir, exist_ok=True)
         blend_stem = os.path.splitext(bpy.path.basename(bpy.data.filepath))[0] or "assembled"
-        out_path   = os.path.join(video_dir, blend_stem + ".mkv")
 
-        # ── Build ffmpeg command ──────────────────────────────────
-        cmd = [
-            ffmpeg, "-y",
-            "-framerate",    str(fps),
-            "-start_number", str(start_num),
-            "-i",            pattern,
-            "-c:v",          "libx264",
-            "-crf",          "18",        # perceptually lossless
-            "-preset",       "medium",
-            "-pix_fmt",      "yuv420p",
-            "-an",                        # no audio
-            out_path,
-        ]
+        # ── Build temporary scene for encoding ────────────────────
+        tmp = bpy.data.scenes.new("_NZO_assemble_")
+        tmp.render.resolution_x = scene.render.resolution_x
+        tmp.render.resolution_y = scene.render.resolution_y
+        tmp.render.fps          = scene.render.fps
+        tmp.render.fps_base     = scene.render.fps_base
+        tmp.frame_start         = 1
+        tmp.frame_end           = n
 
-        print(f"[MultiCam] Running: {' '.join(cmd)}")
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-        except subprocess.TimeoutExpired:
-            self.report({"ERROR"}, "ffmpeg timed out (> 10 min).")
-            return {"CANCELLED"}
-        except Exception as e:
-            self.report({"ERROR"}, f"ffmpeg launch error: {e}")
-            return {"CANCELLED"}
+        # ── FFmpeg output settings ────────────────────────────────
+        # Blender 5.0+ requires media_type = 'VIDEO' before file_format = 'FFMPEG'
+        r = tmp.render
+        r.image_settings.media_type          = "VIDEO"
+        r.image_settings.file_format         = "FFMPEG"
+        r.ffmpeg.format                      = "MKV"
+        r.ffmpeg.codec                       = "H264"
+        r.ffmpeg.constant_rate_factor        = "PERCEPTUALLY_LOSSLESS"
+        r.ffmpeg.ffmpeg_preset               = "GOOD"
+        r.ffmpeg.gopsize                     = 18
+        r.ffmpeg.use_max_b_frames            = False
+        r.ffmpeg.audio_codec                 = "NONE"
+        r.use_sequencer                      = True
+        r.filepath                           = os.path.join(video_dir, blend_stem)
 
-        if result.returncode != 0:
-            # Show last 300 chars of stderr for diagnosis
-            err = result.stderr[-300:].replace("\n", " | ")
-            self.report({"ERROR"}, f"ffmpeg failed: {err}")
-            return {"CANCELLED"}
+        # ── Load frames into the temp scene's VSE ────────────────
+        seq   = tmp.sequence_editor_create()
+        strip = seq.sequences.new_image(
+            name        = "frames",
+            filepath    = frame_files[0],
+            channel     = 1,
+            frame_start = 1,
+        )
+        for f in frame_files[1:]:
+            strip.elements.append(os.path.basename(f))
 
-        n = len(frame_files)
-        self.report({"INFO"}, f"Video saved → {out_path}  ({n} frames)")
-        print(f"[MultiCam] Video assembled → {out_path}")
+        # ── Store refs for the completion handler ─────────────────
+        _assemble_state.clear()
+        _assemble_state.update({
+            "window":         context.window,
+            "original_scene": scene,
+            "tmp_scene":      tmp,
+            "video_dir":      video_dir,
+        })
+
+        # ── Register handlers ────────────────────────────────────
+        if _on_assemble_complete not in bpy.app.handlers.render_complete:
+            bpy.app.handlers.render_complete.append(_on_assemble_complete)
+        if _on_assemble_cancel not in bpy.app.handlers.render_cancel:
+            bpy.app.handlers.render_cancel.append(_on_assemble_cancel)
+
+        # ── Switch window to temp scene, then launch render ──────
+        context.window.scene = tmp
+        bpy.app.timers.register(_launch_assemble_render, first_interval=0.15)
+
+        self.report({"INFO"}, f"Assembling {n} frames → VIDEO/{blend_stem}.mkv")
         return {"FINISHED"}
 
 
