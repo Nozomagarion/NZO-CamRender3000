@@ -101,8 +101,8 @@ def _save_state(scene):
 
 def _update_cam_range_from_selection(self, context):
     """Called when the active index in the UIList changes.
-    Reads the selected camera's keyframe range and writes it
-    into the Create Camera Start / End fields."""
+    Selects the camera in the viewport (so its keyframes show in
+    the timeline) and updates the Create Camera Start/End fields."""
     col = self.multicam_cameras       # self = Scene
     idx = self.multicam_active_index
     if not (0 <= idx < len(col)):
@@ -110,6 +110,16 @@ def _update_cam_range_from_selection(self, context):
     cam_obj = bpy.data.objects.get(col[idx].cam_name)
     if cam_obj is None:
         return
+
+    # Select the camera object in the viewport
+    try:
+        for obj in context.selected_objects:
+            obj.select_set(False)
+        cam_obj.select_set(True)
+        context.view_layer.objects.active = cam_obj
+    except Exception:
+        pass
+
     fmin, fmax = get_keyframe_range(cam_obj)
     if fmin is not None:
         duration = fmax - fmin
