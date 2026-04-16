@@ -496,7 +496,7 @@ class MULTICAM_OT_AssembleVideo(Operator):
 
         # ── Load frames into the temp scene's VSE ────────────────
         seq   = tmp.sequence_editor_create()
-        strip = seq.sequences.new_image(
+        strip = seq.strips.new_image(
             name        = "frames",
             filepath    = frame_files[0],
             channel     = 1,
