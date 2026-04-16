@@ -1,5 +1,5 @@
 # ============================================================
-#  Multi-Camera Sequence Render — Blender 5.1  (v1.3)
+#  Multi-Camera Sequence Render — Blender 5.1  (v1.4)
 #
 #  STRATEGY: instead of chaining multiple render.render() calls
 #  (which silently fail because G.is_rendering is still True),
@@ -19,7 +19,7 @@
 bl_info = {
     "name":        "NZO CamRender3000",
     "author":      "NZO",
-    "version":     (1, 3, 0),
+    "version":     (1, 4, 0),
     "blender":     (5, 1, 0),
     "location":    "View3D › Sidebar › MultiCam",
     "description": "Batch-render multiple cameras sequentially using their own keyframe ranges",
@@ -358,6 +358,75 @@ class MULTICAM_OT_RenderSequence(Operator):
 
 
 # ──────────────────────────────────────────────────────────────
+#  Operator: Create camera at current viewport view
+# ──────────────────────────────────────────────────────────────
+
+class MULTICAM_OT_AddCamera(Operator):
+    """Create a new camera aligned to the current viewport view,
+    with a fixed-position keyframe at frame_start AND frame_end.
+    The camera immediately appears in the list ready to render."""
+
+    bl_idname      = "multicam.add_camera"
+    bl_label       = "Add Camera at Current View"
+    bl_description = (
+        "Create a camera from the current viewport angle and keyframe it "
+        "at the defined start/end frames so it appears in the render list"
+    )
+
+    def execute(self, context):
+        scene = context.scene
+        fstart = scene.multicam_new_cam_start
+        fend   = scene.multicam_new_cam_end
+
+        # ── Validate frame range ────────────────────────────────
+        if fend <= fstart:
+            self.report({"ERROR"},
+                        f"End frame ({fend}) must be greater than start frame ({fstart}).")
+            return {"CANCELLED"}
+
+        # ── Remember current state ──────────────────────────────
+        original_frame    = scene.frame_current
+        original_camera   = scene.camera
+        original_active   = context.view_layer.objects.active
+        original_selected = list(context.selected_objects)
+
+        # ── Deselect all then create camera aligned to viewport ─
+        bpy.ops.object.select_all(action='DESELECT')
+        bpy.ops.object.camera_add(align='VIEW')
+
+        cam_obj = context.active_object   # the newly created camera
+
+        # ── Auto-name by next available slot ───────────────────
+        existing = {o.name for o in bpy.data.objects if o.type == 'CAMERA'}
+        # camera_add already gave it a default name; keep it as-is
+        cam_name = cam_obj.name
+
+        # ── Insert keyframe at start frame (location + rotation) ─
+        scene.frame_set(fstart)
+        cam_obj.keyframe_insert(data_path="location",       frame=fstart)
+        cam_obj.keyframe_insert(data_path="rotation_euler", frame=fstart)
+
+        # ── Insert keyframe at end frame (same position = static) ─
+        scene.frame_set(fend)
+        cam_obj.keyframe_insert(data_path="location",       frame=fend)
+        cam_obj.keyframe_insert(data_path="rotation_euler", frame=fend)
+
+        # ── Restore timeline position ───────────────────────────
+        scene.frame_set(original_frame)
+
+        # ── Update next-camera defaults (next slot right after) ─
+        scene.multicam_new_cam_start = fend + 1
+        scene.multicam_new_cam_end   = fend + (fend - fstart)
+
+        # ── Refresh the camera list ─────────────────────────────
+        bpy.ops.multicam.refresh_cameras()
+
+        self.report({"INFO"},
+                    f"Camera '{cam_name}' created — frames {fstart}–{fend}.")
+        return {"FINISHED"}
+
+
+# ──────────────────────────────────────────────────────────────
 #  Panel — N-Panel › MultiCam tab
 # ──────────────────────────────────────────────────────────────
 
@@ -421,6 +490,36 @@ class MULTICAM_PT_MainPanel(Panel):
             return  # hide edit UI while rendering
 
         # ── NORMAL UI ───────────────────────────────────────────
+
+        # ── CREATE CAMERA section ───────────────────────────────
+        box = layout.box()
+        box.label(text="Create Camera", icon="ADD")
+
+        # Frame range row
+        row = box.row(align=True)
+        row.label(text="Range :")
+        sub = row.row(align=True)
+        sub.prop(scene, "multicam_new_cam_start", text="Start")
+        sub.prop(scene, "multicam_new_cam_end",   text="End")
+
+        # Duration hint
+        fstart = scene.multicam_new_cam_start
+        fend   = scene.multicam_new_cam_end
+        dur    = fend - fstart
+        hint   = f"{dur} frames" if dur > 0 else "⚠ end must be > start"
+        box.label(text=hint, icon="TIME")
+
+        # Create button
+        row = box.row()
+        row.scale_y = 1.4
+        row.enabled = fend > fstart
+        row.operator("multicam.add_camera",
+                     text="Add Camera at Current View",
+                     icon="CAMERA_DATA")
+
+        layout.separator()
+
+        # ── CAMERA LIST section ─────────────────────────────────
         layout.operator("multicam.refresh_cameras",
                         text="Refresh Camera List",
                         icon="FILE_REFRESH")
@@ -465,6 +564,7 @@ _CLASSES = (
     CameraRenderItem,
     MULTICAM_UL_CameraList,
     MULTICAM_OT_RefreshCameras,
+    MULTICAM_OT_AddCamera,
     MULTICAM_OT_RenderSequence,
     MULTICAM_PT_MainPanel,
 )
@@ -479,6 +579,16 @@ def register():
     bpy.types.Scene.multicam_active_index = IntProperty(
         name="Active Camera Index", default=0,
     )
+    bpy.types.Scene.multicam_new_cam_start = IntProperty(
+        name="Start Frame",
+        description="First frame of the new camera's render range",
+        default=0, min=0,
+    )
+    bpy.types.Scene.multicam_new_cam_end = IntProperty(
+        name="End Frame",
+        description="Last frame of the new camera's render range",
+        default=60, min=0,
+    )
 
 
 def unregister():
@@ -488,6 +598,8 @@ def unregister():
         bpy.utils.unregister_class(cls)
     del bpy.types.Scene.multicam_cameras
     del bpy.types.Scene.multicam_active_index
+    del bpy.types.Scene.multicam_new_cam_start
+    del bpy.types.Scene.multicam_new_cam_end
 
 
 if __name__ == "__main__":
